@@ -1,5 +1,10 @@
 vcl 4.0;
 
+backend bucket {
+  .host = "unisysbucket.s3.amazonaws.com";
+  .port = "80";
+}
+
 # Default backend definition. Points to Apache, normally.
 backend default {
     .host = "{{ getenv "VARNISH_BACKEND_HOST" }}";
@@ -54,6 +59,24 @@ sub vcl_recv {
     # Only cache GET and HEAD requests (pass through POST requests).
     if (req.method != "GET" && req.method != "HEAD") {
         return (pass);
+    }
+
+    if (req.url ~ "^/bucket/") {
+        //clean up for S3
+        unset req.http.cookie;
+        unset req.http.cache-control;
+        unset req.http.pragma;
+        unset req.http.expires;
+        unset req.http.etag;
+        unset req.http.X-Forwarded-For;
+        unset req.http.CF-Connecting-IP;
+
+        //set correct backend
+        set req.backend_hint = bucket;
+        set req.http.host = "unisysbucket.s3.amazonaws.com";
+        //done with this request, forward it to backend
+        return(pass);
+
     }
 
     # Pass through any administrative or AJAX-related paths.
@@ -161,6 +184,22 @@ sub vcl_deliver {
     else {
         set resp.http.X-Varnish-Cache = "MISS";
     }
+    //s3 stuff
+    unset resp.http.X-Amz-Id-2;
+    unset resp.http.X-Amz-Meta-Group;
+    unset resp.http.X-Amz-Meta-Owner;
+    unset resp.http.X-Amz-Meta-Permissions;
+    unset resp.http.X-Amz-Request-Id;
+
+    if (req.http.host ~ "s3.bucket.us-east-1.amazonaws.com") {
+        if(resp.status == 404){
+            return(synth(700)); //not found
+
+        //convert all other errors from S3 into "520 Unknown Error"
+        }elseif(resp.status != 200){
+            return(synth(600));
+        }
+    }
 }
 
 # Instruct Varnish what to do in the case of certain backend responses (beresp).
@@ -222,6 +261,26 @@ sub vcl_pipe {
     }
 
     return (pipe);
+}
+
+sub vcl_synth {
+    if (resp.status > 550) {
+        set resp.http.Content-Type = "text/plain; charset=utf-8";
+        if (resp.status == 900) {
+            set resp.status = 405;
+            synthetic({"Method Not Allowed"});
+        }elseif (resp.status == 800) {
+            set resp.status = 403;
+            synthetic({"Hotlinking Not Allowed"});
+        }elseif (resp.status == 700) {
+            set resp.status = 404;
+            synthetic({"Not Found"});
+        }elseif (resp.status == 600) {
+            set resp.status = 520;
+            synthetic({"Unknown Error"});
+        }
+    }
+    return(deliver);
 }
 
 # In the event of an error, show friendlier messages.
